@@ -73,9 +73,12 @@ def parse_clang_ast(input_file):
         # Only consider nodes from the main file, not from included headers (after preprocessing they might be there though)
         # But if we want to extract from the "spaghetti code" we probably want the ones defined in the input_file.
         if node.location.file and node.location.file.name != str(input_file):
+             # We still might want to traverse namespaces defined in the file
+             # but containing things from other files? Unlikely for this use case.
              return
 
-        if node.kind == clang.cindex.CursorKind.FUNCTION_DECL:
+        if node.kind == clang.cindex.CursorKind.FUNCTION_DECL or \
+           node.kind == clang.cindex.CursorKind.CXX_METHOD:
             if node.is_definition():
                 functions.append(node)
 
@@ -90,6 +93,10 @@ def parse_clang_ast(input_file):
             classes.append(node)
         elif node.kind == clang.cindex.CursorKind.INCLUSION_DIRECTIVE:
             includes.append(node)
+        elif node.kind == clang.cindex.CursorKind.NAMESPACE:
+            # We don't want to extract the namespace definition itself as an item,
+            # but we need to traverse into it.
+            pass
 
         # Recursively visit child nodes
         for child in node.get_children():
@@ -156,6 +163,18 @@ def extract_code_from_node(node):
         return ''
 
 
+def get_full_name(node):
+    """
+    Returns the full name including namespaces/classes.
+    """
+    parts = []
+    curr = node
+    while curr and curr.kind not in [clang.cindex.CursorKind.TRANSLATION_UNIT, clang.cindex.CursorKind.INVALID_FILE]:
+        if curr.spelling:
+            parts.append(curr.spelling)
+        curr = curr.semantic_parent
+    return "::".join(reversed(parts))
+
 def format_function_signature(func):
     """
     Format the function signature for declaration in the header file.
@@ -177,20 +196,59 @@ def format_function_signature(func):
                 lines = f.readlines()
 
             if start.line == end.line:
-                return lines[start.line - 1][start.column - 1 : end.column - 1].strip() + ";"
+                sig = lines[start.line - 1][start.column - 1 : end.column - 1].strip()
+            else:
+                res = []
+                res.append(lines[start.line - 1][start.column - 1 :])
+                for i in range(start.line, end.line - 1):
+                    res.append(lines[i])
+                res.append(lines[end.line - 1][: end.column - 1])
+                sig = "".join(res).strip()
 
-            res = []
-            res.append(lines[start.line - 1][start.column - 1 :])
-            for i in range(start.line, end.line - 1):
-                res.append(lines[i])
-            res.append(lines[end.line - 1][: end.column - 1])
-            return "".join(res).strip() + ";"
+            # If it's a method defined out-of-line, the signature in header
+            # shouldn't have the class prefix.
+            if func.kind == clang.cindex.CursorKind.CXX_METHOD:
+                if "::" in sig:
+                    # Very naive removal of class prefix
+                    parts = sig.split("::")
+                    # We want to keep everything before the first :: that is not the class name?
+                    # Actually, we should just use the function spelling and return type.
+                    # But the signature can have many things (const, virtual, etc.)
+                    pass
+
+            return sig + ";"
 
         return func.type.spelling + " " + func.spelling + ";" # Fallback
     except Exception as e:
         logging.error(f"Error formatting function signature for {func.spelling}: {e}")
         return ''
 
+
+def get_namespace_path(node):
+    """
+    Returns list of namespaces.
+    """
+    parts = []
+    curr = node.semantic_parent
+    while curr and curr.kind == clang.cindex.CursorKind.NAMESPACE:
+        if curr.spelling:
+            parts.append(curr.spelling)
+        curr = curr.semantic_parent
+    return list(reversed(parts))
+
+def wrap_in_namespaces(code, namespaces):
+    """
+    Wraps the code in namespace blocks.
+    """
+    if not namespaces:
+        return code
+    res = []
+    for ns in namespaces:
+        res.append(f"namespace {ns} {{")
+    res.append(code)
+    for ns in reversed(namespaces):
+        res.append(f"}} // namespace {ns}")
+    return "\n".join(res)
 
 def generate_cpp_header_and_implementation(output_dir, functions, variables, classes, includes, target_names=None):
     """
@@ -215,9 +273,6 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
         if includes:
             hf.write("// Extracted Includes\n")
             for inc in includes:
-                # Basic include extraction
-                # Clang doesn't easily expose if it was <header> or "header"
-                # But we can try to find it in the original line
                 try:
                     line = open(inc.location.file.name).readlines()[inc.location.line - 1]
                     if '"' in line:
@@ -230,18 +285,29 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
 
         hf.write("// Declarations of extracted functions\n")
         for func in selected_functions:
+            # For methods defined out of line, we don't want to redeclare them in header
+            # as they are part of the class.
+            if func.kind == clang.cindex.CursorKind.CXX_METHOD:
+                # If it's a method, it should be in the class definition.
+                # However, if we only extract the method and not the class,
+                # we are in trouble anyway.
+                # Let's skip redeclaring methods in the header.
+                continue
             signature = format_function_signature(func)
-            hf.write(signature + '\n')
+            ns = get_namespace_path(func)
+            hf.write(wrap_in_namespaces(signature, ns) + '\n\n')
 
         hf.write("\n// Declarations of extracted variables\n")
         for var in selected_variables:
-            hf.write(f"extern {var.type.spelling} {var.spelling};\n")
+            ns = get_namespace_path(var)
+            hf.write(wrap_in_namespaces(f"extern {var.type.spelling} {var.spelling};", ns) + '\n\n')
 
         hf.write("\n// Definitions of extracted classes\n")
         for cls in selected_classes:
             class_code = extract_code_from_node(cls)
             if class_code:
-                hf.write(class_code + '\n\n')
+                ns = get_namespace_path(cls)
+                hf.write(wrap_in_namespaces(class_code, ns) + '\n\n')
 
         hf.write("\n#endif // EXTRACTED_CODE_H\n")
 
@@ -251,12 +317,24 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
         for func in selected_functions:
             func_code = extract_code_from_node(func)
             if func_code:
+                # If it's a method defined out of line, it's already scoped.
+                # If not, we might need namespace wrap.
+                ns = get_namespace_path(func)
+                # Naive check for out-of-line: spelled with ::
+                # But func.spelling only gives the name, not the full name.
+                # We need to check if the code contains :: before the body.
+                is_out_of_line = "::" in func_code.split('{')[0]
+                if not is_out_of_line and ns:
+                    func_code = wrap_in_namespaces(func_code, ns)
                 cf.write(func_code + '\n\n')
 
         cf.write("\n// Definitions of extracted variables\n")
         for var in selected_variables:
             var_code = extract_code_from_node(var)
             if var_code:
+                ns = get_namespace_path(var)
+                if ns:
+                    var_code = wrap_in_namespaces(var_code, ns)
                 cf.write(var_code + '\n')
 
     logging.info(f"Generated header file: {header_file}")

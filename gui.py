@@ -125,6 +125,7 @@ class App:
             # Map Clang kind to readable text
             kind_map = {
                 "FUNCTION_DECL": "Function",
+                "CXX_METHOD": "Method",
                 "VAR_DECL": "Variable",
                 "CLASS_DECL": "Class",
                 "STRUCT_DECL": "Struct"
