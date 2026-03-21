@@ -119,13 +119,25 @@ class App:
         self.selected_items = {}
         for item in self.found_items:
             var = tk.BooleanVar()
-            self.selected_items[item.spelling] = var
-            kind = item.kind.name.split('_')[-1]
-            cb = tk.Checkbutton(self.scrollable_frame, text=f"{kind}: {item.spelling}", variable=var)
+            # Use USR as key to handle overloads
+            self.selected_items[item.get_usr()] = var
+
+            # Map Clang kind to readable text
+            kind_map = {
+                "FUNCTION_DECL": "Function",
+                "VAR_DECL": "Variable",
+                "CLASS_DECL": "Class",
+                "STRUCT_DECL": "Struct"
+            }
+            kind = kind_map.get(item.kind.name, item.kind.name.split('_')[-1].title())
+
+            # Get location to help disambiguate
+            loc = f"{item.location.line}:{item.location.column}"
+            cb = tk.Checkbutton(self.scrollable_frame, text=f"{kind}: {item.spelling} ({loc})", variable=var)
             cb.pack(anchor="w")
 
     def extract_code(self):
-        targets = [name for name, var in self.selected_items.items() if var.get()]
+        targets = [usr for usr, var in self.selected_items.items() if var.get()]
         if not targets:
             messagebox.showwarning("Warning", "No items selected.")
             return

@@ -41,19 +41,6 @@ libclang_file = find_libclang()
 if libclang_file:
     clang.cindex.Config.set_library_file(libclang_file)
 
-def run_gcc_preprocessor(input_file):
-    """
-    Preprocess the input C++ file using GCC preprocessor to expand macros and includes.
-    """
-    preprocessed_file = input_file.with_suffix('.i')
-    cmd = ['g++', '-E', str(input_file), '-o', str(preprocessed_file)]
-    try:
-        subprocess.run(cmd, check=True)
-        logging.info(f"Preprocessed file generated: {preprocessed_file}")
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Preprocessing failed: {e}")
-        exit(1)
-    return preprocessed_file
 
 
 def parse_clang_ast(input_file):
@@ -64,7 +51,9 @@ def parse_clang_ast(input_file):
     try:
         # Preprocessing with GCC might have added some complexity, let's try parsing directly
         translation_unit = index.parse(
-            str(input_file), args=['-x', 'c++', '-std=c++17']
+            str(input_file),
+            args=['-x', 'c++', '-std=c++17'],
+            options=clang.cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
         )
         for diagnostic in translation_unit.diagnostics:
             logging.warning(f"Clang Diagnostic: {diagnostic}")
@@ -75,6 +64,7 @@ def parse_clang_ast(input_file):
     functions = []
     variables = []
     classes = []
+    includes = []
 
     def extract_declarations(node):
         """
@@ -98,13 +88,15 @@ def parse_clang_ast(input_file):
             classes.append(node)
         elif node.kind == clang.cindex.CursorKind.STRUCT_DECL and node.is_definition():
             classes.append(node)
+        elif node.kind == clang.cindex.CursorKind.INCLUSION_DIRECTIVE:
+            includes.append(node)
 
         # Recursively visit child nodes
         for child in node.get_children():
             extract_declarations(child)
 
     extract_declarations(translation_unit.cursor)
-    return functions, variables, classes
+    return functions, variables, classes, includes
 
 
 def extract_code_from_node(node):
@@ -117,19 +109,43 @@ def extract_code_from_node(node):
         with open(start.file.name, 'r') as f:
             lines = f.readlines()
 
+        # In Clang's extent, 'end' is usually the beginning of the last token.
+        # We need to adjust to include the whole token or just use a simpler line-based approach
+        # if the tokens are tricky.
+
         if start.line == end.line:
-            return lines[start.line - 1][start.column - 1 : end.column - 1]
+            return lines[start.line - 1][start.column - 1 : end.column].strip()
 
         res = []
         res.append(lines[start.line - 1][start.column - 1 :])
         for i in range(start.line, end.line - 1):
             res.append(lines[i])
-        res.append(lines[end.line - 1][: end.column - 1])
-        # Add a semicolon if it's a class or struct and it's missing
-        code = "".join(res)
-        if node.kind in [clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL]:
-            if not code.strip().endswith(';'):
-                code = code.rstrip() + ';'
+        # We try to find the actual end of the token on the last line.
+        # Often the end.column is the *start* of the last token.
+        last_line = lines[end.line - 1]
+        last_line_part = last_line[: end.column]
+        # We scan forward for closing braces or semicolons.
+        remaining = last_line[end.column:]
+        for char in remaining:
+            if char in '};':
+                last_line_part += char
+                break
+            if char not in ' \t\n\r':
+                break
+        res.append(last_line_part)
+
+        code = "".join(res).strip()
+
+        # Add a semicolon if it's a class/struct/var and it's missing
+        needs_semicolon = node.kind in [
+            clang.cindex.CursorKind.CLASS_DECL,
+            clang.cindex.CursorKind.STRUCT_DECL,
+            clang.cindex.CursorKind.VAR_DECL,
+            clang.cindex.CursorKind.FIELD_DECL
+        ]
+        if needs_semicolon and not code.endswith(';'):
+            code += ';'
+
         return code
 
     except FileNotFoundError:
@@ -145,47 +161,73 @@ def format_function_signature(func):
     Format the function signature for declaration in the header file.
     """
     try:
-        # This is a bit naive, but let's try to get the signature before the body
+        # Clang doesn't provide the exact signature text easily,
+        # so we get the extent up to the body.
         start = func.extent.start
-        # We find the first '{' to stop the signature
-        with open(start.file.name, 'r') as f:
-            lines = f.readlines()
-
-        signature_lines = []
-        found_brace = False
-        for i in range(start.line - 1, len(lines)):
-            line = lines[i]
-            if i == start.line - 1:
-                line = line[start.column - 1:]
-
-            if '{' in line:
-                signature_lines.append(line.split('{')[0])
-                found_brace = True
+        # We look for the start of the body
+        body = None
+        for child in func.get_children():
+            if child.kind == clang.cindex.CursorKind.COMPOUND_STMT:
+                body = child
                 break
-            else:
-                signature_lines.append(line)
 
-        if found_brace:
-            return "".join(signature_lines).strip() + ";"
+        if body:
+            end = body.extent.start
+            with open(start.file.name, 'r') as f:
+                lines = f.readlines()
+
+            if start.line == end.line:
+                return lines[start.line - 1][start.column - 1 : end.column - 1].strip() + ";"
+
+            res = []
+            res.append(lines[start.line - 1][start.column - 1 :])
+            for i in range(start.line, end.line - 1):
+                res.append(lines[i])
+            res.append(lines[end.line - 1][: end.column - 1])
+            return "".join(res).strip() + ";"
+
         return func.type.spelling + " " + func.spelling + ";" # Fallback
     except Exception as e:
         logging.error(f"Error formatting function signature for {func.spelling}: {e}")
         return ''
 
 
-def generate_cpp_header_and_implementation(output_dir, functions, variables, classes, target_names=None):
+def generate_cpp_header_and_implementation(output_dir, functions, variables, classes, includes, target_names=None):
     """
     Generate the header (.h) and implementation (.cpp) files for extracted functions, variables, and classes.
     """
     header_file = output_dir / 'extracted_code.h'
     cpp_file = output_dir / 'extracted_code.cpp'
 
-    selected_functions = [f for f in functions if target_names is None or f.spelling in target_names]
-    selected_variables = [v for v in variables if target_names is None or v.spelling in target_names]
-    selected_classes = [c for c in classes if target_names is None or c.spelling in target_names]
+    # target_names can be USR strings to handle overloads
+    def is_selected(item):
+        if target_names is None:
+            return True
+        return item.get_usr() in target_names or item.spelling in target_names
+
+    selected_functions = [f for f in functions if is_selected(f)]
+    selected_variables = [v for v in variables if is_selected(v)]
+    selected_classes = [c for c in classes if is_selected(c)]
 
     with open(header_file, 'w') as hf:
         hf.write("#ifndef EXTRACTED_CODE_H\n#define EXTRACTED_CODE_H\n\n")
+
+        if includes:
+            hf.write("// Extracted Includes\n")
+            for inc in includes:
+                # Basic include extraction
+                # Clang doesn't easily expose if it was <header> or "header"
+                # But we can try to find it in the original line
+                try:
+                    line = open(inc.location.file.name).readlines()[inc.location.line - 1]
+                    if '"' in line:
+                        hf.write(f'#include "{inc.displayname}"\n')
+                    else:
+                        hf.write(f'#include <{inc.displayname}>\n')
+                except:
+                    hf.write(f'#include <{inc.displayname}>\n')
+            hf.write("\n")
+
         hf.write("// Declarations of extracted functions\n")
         for func in selected_functions:
             signature = format_function_signature(func)
@@ -234,11 +276,11 @@ def main(input_file, output_dir, target_names=None):
 
     output_path.mkdir(exist_ok=True)
 
-    # Step 1: Preprocess the code
-    preprocessed_file = run_gcc_preprocessor(input_path)
-
-    # Step 2: Parse AST using Clang
-    functions, variables, classes = parse_clang_ast(input_path)
+    # Step 1: Parse AST using Clang
+    # We parse the original file because parsing the preprocessed file
+    # makes Clang think all definitions are in the .i file, which complicates
+    # extracting from the correct source.
+    functions, variables, classes, includes = parse_clang_ast(input_path)
 
     if target_names is None:
         # If no target names, just list what we found
@@ -248,7 +290,7 @@ def main(input_file, output_dir, target_names=None):
         return functions, variables, classes
 
     # Step 3: Generate header and implementation files
-    generate_cpp_header_and_implementation(output_path, functions, variables, classes, target_names)
+    generate_cpp_header_and_implementation(output_path, functions, variables, classes, includes, target_names)
     return functions, variables, classes
 
 if __name__ == "__main__":
