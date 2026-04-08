@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import refactor_tool
 import logging
+import traceback
 
 class App:
     def __init__(self, root):
@@ -104,11 +105,24 @@ class App:
         def task():
             try:
                 # We need to run this in a thread because it might take time
-                functions, variables, classes = refactor_tool.main(self.input_file.get(), self.output_dir.get())
-                self.found_items = functions + variables + classes
+                result = refactor_tool.main(self.input_file.get(), self.output_dir.get())
+                # Handle both 3-tuple and 4-tuple for backward compatibility if needed,
+                # but our refactor_tool now returns 4 or 5 (due to includes/enums? wait)
+                # Let's check refactor_tool.py main again.
+                if len(result) == 4:
+                     functions, variables, classes, enums = result
+                     self.found_items = functions + variables + classes + enums
+                else:
+                     # Fallback for unexpected return length
+                     self.found_items = []
+                     for items in result:
+                         if isinstance(items, list):
+                             self.found_items.extend(items)
+
                 self.root.after(0, self.update_selection_list)
             except Exception as e:
                 logging.error(f"Analysis failed: {e}")
+                logging.error(traceback.format_exc())
 
         threading.Thread(target=task).start()
 
@@ -128,7 +142,9 @@ class App:
                 "CXX_METHOD": "Method",
                 "VAR_DECL": "Variable",
                 "CLASS_DECL": "Class",
-                "STRUCT_DECL": "Struct"
+                "STRUCT_DECL": "Struct",
+                "CLASS_TEMPLATE": "Class Template",
+                "ENUM_DECL": "Enum"
             }
             kind = kind_map.get(item.kind.name, item.kind.name.split('_')[-1].title())
 

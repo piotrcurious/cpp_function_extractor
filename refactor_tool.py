@@ -4,6 +4,7 @@ from pathlib import Path
 import argparse
 import subprocess
 import logging
+import traceback
 
 # Configure logging for better debugging and user feedback
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -143,7 +144,7 @@ def extract_code_from_node(node):
                 res.append(lines[i])
             last_line = lines[end.line - 1]
             last_line_part = last_line[: end.column]
-            remaining = last_line[end.column - 1:]
+            remaining = last_line[end.column:]
             for char in remaining:
                 if char in '};':
                     last_line_part += char
@@ -434,12 +435,32 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
                         full_class_path.append(curr_p.spelling)
                         curr_p = curr_p.semantic_parent
                     full_class_qualifier = "::".join(reversed(full_class_path))
+
+                    # More robust scoping using tokens
+                    tokens = list(func.get_tokens())
+                    func_name_token = None
+                    for t in tokens:
+                        if t.spelling == func.spelling and t.extent.start.line == func.location.line:
+                            func_name_token = t
+                            break
+
+                    if func_name_token:
+                        # Extract the prefix before the function name and inject the class qualifier
+                        # Since we have the token, we can use its location.
+                        start_of_name = func_name_token.extent.start
+                        # This still requires some line/column logic
+                        pass
+
                     if '{' in func_code:
-                        prefix, body = func_code.split('{', 1)
+                        # Split by the FIRST '{' but we must be careful with initializers.
+                        # Actually, methods MUST have a body starting with { in our case (is_definition)
+                        # but that { might be far.
+                        idx = func_code.find('{')
+                        prefix, body = func_code[:idx], func_code[idx:]
                         if func.spelling in prefix:
                              last_idx = prefix.rfind(func.spelling)
                              new_prefix = prefix[:last_idx] + full_class_qualifier + "::" + prefix[last_idx:]
-                             func_code = new_prefix + '{' + body
+                             func_code = new_prefix + body
 
                 if ns:
                     already_wrapped = False
@@ -478,7 +499,7 @@ def main(input_file, output_dir, target_names=None):
     input_path, output_path = Path(input_file), Path(output_dir)
     if not input_path.exists():
         logging.error(f"Input file {input_path} does not exist.")
-        return [], [], []
+        return [], [], [], []
     output_path.mkdir(exist_ok=True)
     functions, variables, classes, includes, enums = parse_clang_ast(input_path)
     if target_names is None:
@@ -486,9 +507,9 @@ def main(input_file, output_dir, target_names=None):
         logging.info("Found variables: " + ", ".join([v.spelling for v in variables]))
         logging.info("Found classes: " + ", ".join([c.spelling for c in classes]))
         logging.info("Found enums: " + ", ".join([e.spelling for e in enums]))
-        return functions, variables, classes
+        return functions, variables, classes, enums
     generate_cpp_header_and_implementation(output_path, functions, variables, classes, includes, enums, target_names)
-    return functions, variables, classes
+    return functions, variables, classes, enums
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="C++ Code Extraction and Refactoring Tool")
