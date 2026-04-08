@@ -4,7 +4,6 @@ from pathlib import Path
 import argparse
 import subprocess
 import logging
-import traceback
 
 # Configure logging for better debugging and user feedback
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -91,7 +90,9 @@ def parse_clang_ast(input_file):
         if node.location.file and node.location.file.name != str(input_file):
              return
 
-        if node.kind in [clang.cindex.CursorKind.FUNCTION_DECL, clang.cindex.CursorKind.CXX_METHOD]:
+        if node.kind in [clang.cindex.CursorKind.FUNCTION_DECL,
+                         clang.cindex.CursorKind.CXX_METHOD,
+                         clang.cindex.CursorKind.FUNCTION_TEMPLATE]:
             if node.is_definition():
                 functions.append(node)
         elif node.kind == clang.cindex.CursorKind.VAR_DECL:
@@ -102,6 +103,7 @@ def parse_clang_ast(input_file):
             if is_global or is_static_member:
                 variables.append(node)
         elif node.kind in [clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL,
+                           clang.cindex.CursorKind.UNION_DECL,
                            clang.cindex.CursorKind.CLASS_TEMPLATE] and node.is_definition():
             classes.append(node)
         elif node.kind == clang.cindex.CursorKind.ENUM_DECL and node.is_definition():
@@ -156,6 +158,7 @@ def extract_code_from_node(node):
 
         needs_semicolon = node.kind in [
             clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL,
+            clang.cindex.CursorKind.UNION_DECL,
             clang.cindex.CursorKind.CLASS_TEMPLATE, clang.cindex.CursorKind.VAR_DECL,
             clang.cindex.CursorKind.FIELD_DECL, clang.cindex.CursorKind.ENUM_DECL
         ]
@@ -224,7 +227,8 @@ def get_full_namespace_and_class_path(node):
     curr = node.semantic_parent
     while curr and curr.kind != clang.cindex.CursorKind.TRANSLATION_UNIT:
         if curr.kind in [clang.cindex.CursorKind.NAMESPACE, clang.cindex.CursorKind.CLASS_DECL,
-                         clang.cindex.CursorKind.STRUCT_DECL, clang.cindex.CursorKind.CLASS_TEMPLATE]:
+                         clang.cindex.CursorKind.STRUCT_DECL, clang.cindex.CursorKind.UNION_DECL,
+                         clang.cindex.CursorKind.CLASS_TEMPLATE]:
             if curr.spelling:
                 parts.append(curr)
         curr = curr.semantic_parent
@@ -336,6 +340,7 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
             item = f"{var.type.spelling} {var.spelling};"
             if var.semantic_parent.kind in [clang.cindex.CursorKind.CLASS_DECL,
                                             clang.cindex.CursorKind.STRUCT_DECL,
+                                            clang.cindex.CursorKind.UNION_DECL,
                                             clang.cindex.CursorKind.CLASS_TEMPLATE]:
                 item = f"static {item}"
             else:
@@ -389,6 +394,8 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
                         k = "class"
                         if kind == clang.cindex.CursorKind.STRUCT_DECL:
                             k = "struct"
+                        elif kind == clang.cindex.CursorKind.UNION_DECL:
+                            k = "union"
                         elif kind == clang.cindex.CursorKind.CLASS_TEMPLATE:
                             params = get_template_params(node)
                             res.append(f"{indent}template <{params}>")
@@ -431,25 +438,11 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
                     curr_p = func.semantic_parent
                     while curr_p and curr_p.kind in [clang.cindex.CursorKind.CLASS_DECL,
                                                      clang.cindex.CursorKind.STRUCT_DECL,
+                                                     clang.cindex.CursorKind.UNION_DECL,
                                                      clang.cindex.CursorKind.CLASS_TEMPLATE]:
                         full_class_path.append(curr_p.spelling)
                         curr_p = curr_p.semantic_parent
                     full_class_qualifier = "::".join(reversed(full_class_path))
-
-                    # More robust scoping using tokens
-                    tokens = list(func.get_tokens())
-                    func_name_token = None
-                    for t in tokens:
-                        if t.spelling == func.spelling and t.extent.start.line == func.location.line:
-                            func_name_token = t
-                            break
-
-                    if func_name_token:
-                        # Extract the prefix before the function name and inject the class qualifier
-                        # Since we have the token, we can use its location.
-                        start_of_name = func_name_token.extent.start
-                        # This still requires some line/column logic
-                        pass
 
                     if '{' in func_code:
                         # Split by the FIRST '{' but we must be careful with initializers.
