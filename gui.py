@@ -143,7 +143,9 @@ class App:
                 "VAR_DECL": "Variable",
                 "CLASS_DECL": "Class",
                 "STRUCT_DECL": "Struct",
+                "UNION_DECL": "Union",
                 "CLASS_TEMPLATE": "Class Template",
+                "FUNCTION_TEMPLATE": "Function Template",
                 "ENUM_DECL": "Enum"
             }
             kind = kind_map.get(item.kind.name, item.kind.name.split('_')[-1].title())
