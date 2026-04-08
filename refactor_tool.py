@@ -202,8 +202,12 @@ def format_function_signature(func):
 
         if sig_tokens:
             sig = " ".join(sig_tokens)
-            sig = sig.replace(" (", "(").replace("( ", "(").replace(" )", ")").replace(" *", "*").replace(" &", "&")
-            sig = sig.replace(" ,", ",").replace(" :", ":").replace(":: ", "::").replace(" ::", "::")
+            # Refined C++ spacing cleanup
+            sig = sig.replace(" (", "(").replace("( ", "(").replace(" )", ")")
+            sig = sig.replace(" *", "*").replace(" &", "&")
+            sig = sig.replace(" ,", ",").replace(" :", ":")
+            sig = sig.replace(":: ", "::").replace(" ::", "::")
+            sig = sig.replace("< ", "<").replace(" >", ">").replace(" <", "<")
             return sig.strip() + ";"
 
         return func.type.spelling + " " + func.spelling + ";"
@@ -280,21 +284,29 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
                     hf.write(f'#include <{inc.displayname}>\n')
             hf.write("\n")
 
-        hf.write("\n// Definitions of extracted enums\n")
+        grouped_items = {}
+
+        def add_to_grouped_items(item_node, code_snippet):
+            path_nodes = get_full_namespace_and_class_path(item_node)
+            path_key = tuple(n.get_usr() for n in path_nodes)
+            if path_key not in grouped_items:
+                grouped_items[path_key] = {'nodes': path_nodes, 'items': []}
+            if code_snippet not in grouped_items[path_key]['items']:
+                grouped_items[path_key]['items'].append(code_snippet)
+
+        # Handle enums
         for enm in selected_enums:
             enm_code = extract_code_from_node(enm)
             if enm_code:
-                ns = get_namespace_path(enm)
-                hf.write(wrap_in_namespaces(enm_code, ns) + '\n\n')
+                add_to_grouped_items(enm, enm_code)
 
-        hf.write("\n// Definitions of extracted classes\n")
+        # Handle classes/structs/unions/templates
         for cls in selected_classes:
             class_code = extract_code_from_node(cls)
             if class_code:
-                ns = get_namespace_path(cls)
-                hf.write(wrap_in_namespaces(class_code, ns) + '\n\n')
+                add_to_grouped_items(cls, class_code)
 
-        grouped_items = {}
+
         for func in selected_functions:
             if func.kind == clang.cindex.CursorKind.CXX_METHOD:
                 curr, skip = func.semantic_parent, False
@@ -306,11 +318,6 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
                 if skip:
                     continue
 
-            path_nodes = get_full_namespace_and_class_path(func)
-            path_key = tuple(n.get_usr() for n in path_nodes)
-            if path_key not in grouped_items:
-                grouped_items[path_key] = {'nodes': path_nodes, 'items': []}
-
             signature = format_function_signature(func)
             if signature:
                 if func.kind == clang.cindex.CursorKind.CXX_METHOD:
@@ -320,7 +327,7 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
                          while start_idx > 0 and (signature[start_idx-1].isalnum() or signature[start_idx-1] in '_:'):
                              start_idx -= 1
                          signature = signature[:start_idx] + signature[idx+2:]
-                grouped_items[path_key]['items'].append(signature)
+                add_to_grouped_items(func, signature)
 
         for var in selected_variables:
             curr, already_in_header = var.semantic_parent, False
@@ -332,11 +339,6 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
             if already_in_header:
                 continue
 
-            path_nodes = get_full_namespace_and_class_path(var)
-            path_key = tuple(n.get_usr() for n in path_nodes)
-            if path_key not in grouped_items:
-                grouped_items[path_key] = {'nodes': path_nodes, 'items': []}
-
             item = f"{var.type.spelling} {var.spelling};"
             if var.semantic_parent.kind in [clang.cindex.CursorKind.CLASS_DECL,
                                             clang.cindex.CursorKind.STRUCT_DECL,
@@ -345,8 +347,7 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
                 item = f"static {item}"
             else:
                 item = f"extern {item}"
-            if item not in grouped_items[path_key]['items']:
-                grouped_items[path_key]['items'].append(item)
+            add_to_grouped_items(var, item)
 
         def emit_grouped_items(items_dict):
             tree = {}
@@ -391,21 +392,35 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
                             res.append(f"{indent}    {item}")
                         res.append(f"{indent}}} // namespace {name}")
                     else:
-                        k = "class"
-                        if kind == clang.cindex.CursorKind.STRUCT_DECL:
-                            k = "struct"
-                        elif kind == clang.cindex.CursorKind.UNION_DECL:
-                            k = "union"
-                        elif kind == clang.cindex.CursorKind.CLASS_TEMPLATE:
-                            params = get_template_params(node)
-                            res.append(f"{indent}template <{params}>")
-                            k = "struct" if "struct" in extract_code_from_node(node).split('{')[0] else "class"
-                        res.append(f"{indent}{k} {name} {{")
-                        res.append(f"{indent}public:")
-                        res.extend(print_tree(data['_children'], indent + "    "))
+                        # If it's a class/struct/union/template that is ALREADY extracted as a block
+                        # we don't want to re-wrap it in a minimal declaration.
+                        # We check if any item is the full definition.
+                        is_full_definition = False
                         for item in data['_items']:
-                            res.append(f"{indent}    {item}")
-                        res.append(f"{indent}}};")
+                            if name in item and ('{' in item or 'enum' in item or 'union' in item):
+                                is_full_definition = True
+                                break
+
+                        if is_full_definition:
+                             for item in data['_items']:
+                                 res.append(f"{indent}{item}")
+                             res.extend(print_tree(data['_children'], indent))
+                        else:
+                            k = "class"
+                            if kind == clang.cindex.CursorKind.STRUCT_DECL:
+                                k = "struct"
+                            elif kind == clang.cindex.CursorKind.UNION_DECL:
+                                k = "union"
+                            elif kind == clang.cindex.CursorKind.CLASS_TEMPLATE:
+                                params = get_template_params(node)
+                                res.append(f"{indent}template <{params}>")
+                                k = "struct" if "struct" in extract_code_from_node(node).split('{')[0] else "class"
+                            res.append(f"{indent}{k} {name} {{")
+                            res.append(f"{indent}public:")
+                            res.extend(print_tree(data['_children'], indent + "    "))
+                            for item in data['_items']:
+                                res.append(f"{indent}    {item}")
+                            res.append(f"{indent}}};")
                 return res
             return "\n".join(print_tree(tree))
 
