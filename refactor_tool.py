@@ -42,24 +42,57 @@ if libclang_file:
     clang.cindex.Config.set_library_file(libclang_file)
 
 
-
 def parse_clang_ast(input_file):
     """
     Parse the input C++ file using Clang to extract functions, variables, and classes.
     """
     index = clang.cindex.Index.create()
+
+    # We can try to find the system include paths to avoid crashes with <iostream> etc.
+    args = ['-x', 'c++', '-std=c++17', '-D__CODE_GENERATOR__']
+
+    # Try to get system include paths from g++
+    try:
+        proc = subprocess.run(['g++', '-E', '-x', 'c++', '-', '-v'],
+                              input='', capture_output=True, text=True)
+        in_includes = False
+        for line in proc.stderr.splitlines():
+            if '#include <...> search starts here:' in line:
+                in_includes = True
+                continue
+            if 'End of search list.' in line:
+                in_includes = False
+                continue
+            if in_includes:
+                path = line.strip()
+                if os.path.exists(path):
+                    args.extend(["-isystem", path])
+    except Exception as e:
+        logging.warning(f"Could not determine system include paths from g++: {e}")
+
     try:
         # Preprocessing with GCC might have added some complexity, let's try parsing directly
-        translation_unit = index.parse(
-            str(input_file),
-            args=['-x', 'c++', '-std=c++17'],
-            options=clang.cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
-        )
+        # If it crashes, we try again with a very minimal set of arguments
+        try:
+            translation_unit = index.parse(
+                str(input_file),
+                args=args,
+                options=clang.cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
+            )
+        except Exception:
+             translation_unit = index.parse(
+                str(input_file),
+                args=['-x', 'c++', '-std=c++17', '-D__CODE_GENERATOR__'],
+                options=0
+            )
         for diagnostic in translation_unit.diagnostics:
-            logging.warning(f"Clang Diagnostic: {diagnostic}")
+            if diagnostic.severity >= clang.cindex.Diagnostic.Error:
+                logging.error(f"Clang Diagnostic: {diagnostic}")
+            else:
+                logging.warning(f"Clang Diagnostic: {diagnostic}")
     except Exception as e:
         logging.error(f"Failed to parse file: {e}")
-        exit(1)
+        return [], [], [], []
 
     functions = []
     variables = []
@@ -70,11 +103,7 @@ def parse_clang_ast(input_file):
         """
         Recursively traverse the AST nodes to find function, variable, and class declarations.
         """
-        # Only consider nodes from the main file, not from included headers (after preprocessing they might be there though)
-        # But if we want to extract from the "spaghetti code" we probably want the ones defined in the input_file.
         if node.location.file and node.location.file.name != str(input_file):
-             # We still might want to traverse namespaces defined in the file
-             # but containing things from other files? Unlikely for this use case.
              return
 
         if node.kind == clang.cindex.CursorKind.FUNCTION_DECL or \
@@ -83,22 +112,21 @@ def parse_clang_ast(input_file):
                 functions.append(node)
 
         elif node.kind == clang.cindex.CursorKind.VAR_DECL:
-            # We might want only global variables
-            if node.semantic_parent.kind == clang.cindex.CursorKind.TRANSLATION_UNIT:
+            # We want global variables OR static class members
+            is_global = node.semantic_parent.kind == clang.cindex.CursorKind.TRANSLATION_UNIT
+            is_static_member = node.semantic_parent.kind in [clang.cindex.CursorKind.CLASS_DECL,
+                                                            clang.cindex.CursorKind.STRUCT_DECL,
+                                                            clang.cindex.CursorKind.CLASS_TEMPLATE]
+            if is_global or is_static_member:
                 variables.append(node)
 
-        elif node.kind == clang.cindex.CursorKind.CLASS_DECL and node.is_definition():
-            classes.append(node)
-        elif node.kind == clang.cindex.CursorKind.STRUCT_DECL and node.is_definition():
+        elif node.kind in [clang.cindex.CursorKind.CLASS_DECL,
+                           clang.cindex.CursorKind.STRUCT_DECL,
+                           clang.cindex.CursorKind.CLASS_TEMPLATE] and node.is_definition():
             classes.append(node)
         elif node.kind == clang.cindex.CursorKind.INCLUSION_DIRECTIVE:
             includes.append(node)
-        elif node.kind == clang.cindex.CursorKind.NAMESPACE:
-            # We don't want to extract the namespace definition itself as an item,
-            # but we need to traverse into it.
-            pass
 
-        # Recursively visit child nodes
         for child in node.get_children():
             extract_declarations(child)
 
@@ -116,10 +144,6 @@ def extract_code_from_node(node):
         with open(start.file.name, 'r') as f:
             lines = f.readlines()
 
-        # In Clang's extent, 'end' is usually the beginning of the last token.
-        # We need to adjust to include the whole token or just use a simpler line-based approach
-        # if the tokens are tricky.
-
         if start.line == end.line:
             return lines[start.line - 1][start.column - 1 : end.column].strip()
 
@@ -127,26 +151,41 @@ def extract_code_from_node(node):
         res.append(lines[start.line - 1][start.column - 1 :])
         for i in range(start.line, end.line - 1):
             res.append(lines[i])
-        # We try to find the actual end of the token on the last line.
-        # Often the end.column is the *start* of the last token.
+
         last_line = lines[end.line - 1]
-        last_line_part = last_line[: end.column]
-        # We scan forward for closing braces or semicolons.
-        remaining = last_line[end.column:]
-        for char in remaining:
-            if char in '};':
-                last_line_part += char
-                break
-            if char not in ' \t\n\r':
-                break
-        res.append(last_line_part)
 
-        code = "".join(res).strip()
+        # Improved token scanning
+        tokens = list(node.get_tokens())
+        if tokens:
+            last_token = tokens[-1]
+            end_loc = last_token.extent.end
+            res = []
+            if start.line == end_loc.line:
+                code = lines[start.line - 1][start.column - 1 : end_loc.column - 1].strip()
+            else:
+                res.append(lines[start.line - 1][start.column - 1 :])
+                for i in range(start.line, end_loc.line - 1):
+                    res.append(lines[i])
+                res.append(lines[end_loc.line - 1][: end_loc.column - 1])
+                code = "".join(res).strip()
+        else:
+            last_line_part = last_line[: end.column]
+            remaining = last_line[end.column - 1:]
+            for char in remaining:
+                if char in '};':
+                    last_line_part += char
+                    break
+                if char not in ' \t\n\r':
+                    # If we see another character before } or ;, we probably shouldn't append it
+                    # but for safety we'll stop scanning to avoid over-consuming.
+                    break
+            res.append(last_line_part)
+            code = "".join(res).strip()
 
-        # Add a semicolon if it's a class/struct/var and it's missing
         needs_semicolon = node.kind in [
             clang.cindex.CursorKind.CLASS_DECL,
             clang.cindex.CursorKind.STRUCT_DECL,
+            clang.cindex.CursorKind.CLASS_TEMPLATE,
             clang.cindex.CursorKind.VAR_DECL,
             clang.cindex.CursorKind.FIELD_DECL
         ]
@@ -155,9 +194,6 @@ def extract_code_from_node(node):
 
         return code
 
-    except FileNotFoundError:
-        logging.error(f"Source file {start.file.name} not found.")
-        return ''
     except Exception as e:
         logging.error(f"Error extracting code for {node.spelling}: {e}")
         return ''
@@ -180,10 +216,38 @@ def format_function_signature(func):
     Format the function signature for declaration in the header file.
     """
     try:
-        # Clang doesn't provide the exact signature text easily,
-        # so we get the extent up to the body.
+        # Use tokens for more precise extraction
+        tokens = list(func.get_tokens())
+        if not tokens:
+             return func.type.spelling + " " + func.spelling + ";" # Fallback
+
+        # We want the tokens before the body starts
+        body_start = None
+        for child in func.get_children():
+            if child.kind == clang.cindex.CursorKind.COMPOUND_STMT:
+                body_start = child.extent.start
+                break
+
+        sig_tokens = []
+        for token in tokens:
+            if body_start and token.extent.start.line >= body_start.line and \
+               token.extent.start.column >= body_start.column:
+                break
+            # Skip the body and also any attributes that might be attached to the body?
+            # Usually we just stop at '{'
+            if token.spelling == '{':
+                break
+            sig_tokens.append(token.spelling)
+
+        if sig_tokens:
+            # Join tokens with spaces, then clean up some common C++ spacing issues
+            sig = " ".join(sig_tokens)
+            sig = sig.replace(" (", "(").replace("( ", "(").replace(" )", ")").replace(" *", "*").replace(" &", "&")
+            sig = sig.replace(" ,", ",").replace(" :", ":").replace(":: ", "::").replace(" ::", "::")
+            return sig.strip() + ";"
+
+        # Fallback to older method if token approach fails
         start = func.extent.start
-        # We look for the start of the body
         body = None
         for child in func.get_children():
             if child.kind == clang.cindex.CursorKind.COMPOUND_STMT:
@@ -205,17 +269,6 @@ def format_function_signature(func):
                 res.append(lines[end.line - 1][: end.column - 1])
                 sig = "".join(res).strip()
 
-            # If it's a method defined out-of-line, the signature in header
-            # shouldn't have the class prefix.
-            if func.kind == clang.cindex.CursorKind.CXX_METHOD:
-                if "::" in sig:
-                    # Very naive removal of class prefix
-                    parts = sig.split("::")
-                    # We want to keep everything before the first :: that is not the class name?
-                    # Actually, we should just use the function spelling and return type.
-                    # But the signature can have many things (const, virtual, etc.)
-                    pass
-
             return sig + ";"
 
         return func.type.spelling + " " + func.spelling + ";" # Fallback
@@ -230,9 +283,26 @@ def get_namespace_path(node):
     """
     parts = []
     curr = node.semantic_parent
-    while curr and curr.kind == clang.cindex.CursorKind.NAMESPACE:
-        if curr.spelling:
-            parts.append(curr.spelling)
+    while curr and curr.kind != clang.cindex.CursorKind.TRANSLATION_UNIT:
+        if curr.kind == clang.cindex.CursorKind.NAMESPACE:
+            if curr.spelling:
+                parts.append(curr.spelling)
+        curr = curr.semantic_parent
+    return list(reversed(parts))
+
+def get_full_namespace_and_class_path(node):
+    """
+    Returns list of namespaces and classes.
+    """
+    parts = []
+    curr = node.semantic_parent
+    while curr and curr.kind != clang.cindex.CursorKind.TRANSLATION_UNIT:
+        if curr.kind in [clang.cindex.CursorKind.NAMESPACE,
+                         clang.cindex.CursorKind.CLASS_DECL,
+                         clang.cindex.CursorKind.STRUCT_DECL,
+                         clang.cindex.CursorKind.CLASS_TEMPLATE]:
+            if curr.spelling:
+                parts.append((curr.kind, curr.spelling))
         curr = curr.semantic_parent
     return list(reversed(parts))
 
@@ -257,11 +327,15 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
     header_file = output_dir / 'extracted_code.h'
     cpp_file = output_dir / 'extracted_code.cpp'
 
-    # target_names can be USR strings to handle overloads
     def is_selected(item):
         if target_names is None:
             return True
-        return item.get_usr() in target_names or item.spelling in target_names
+        if item.get_usr() in target_names or item.spelling in target_names:
+            return True
+        full_name = get_full_name(item)
+        if full_name in target_names:
+            return True
+        return False
 
     selected_functions = [f for f in functions if is_selected(f)]
     selected_variables = [v for v in variables if is_selected(v)]
@@ -283,24 +357,126 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
                     hf.write(f'#include <{inc.displayname}>\n')
             hf.write("\n")
 
-        hf.write("// Declarations of extracted functions\n")
-        for func in selected_functions:
-            # For methods defined out of line, we don't want to redeclare them in header
-            # as they are part of the class.
-            if func.kind == clang.cindex.CursorKind.CXX_METHOD:
-                # If it's a method, it should be in the class definition.
-                # However, if we only extract the method and not the class,
-                # we are in trouble anyway.
-                # Let's skip redeclaring methods in the header.
-                continue
-            signature = format_function_signature(func)
-            ns = get_namespace_path(func)
-            hf.write(wrap_in_namespaces(signature, ns) + '\n\n')
+        grouped_items = {}
 
-        hf.write("\n// Declarations of extracted variables\n")
+        for func in selected_functions:
+            if func.kind == clang.cindex.CursorKind.CXX_METHOD:
+                curr = func.semantic_parent
+                already_in_header = False
+                while curr and curr.kind != clang.cindex.CursorKind.TRANSLATION_UNIT:
+                    if is_selected(curr):
+                        already_in_header = True
+                        break
+                    curr = curr.semantic_parent
+                if already_in_header:
+                    continue
+
+            path = tuple(get_full_namespace_and_class_path(func))
+            if path not in grouped_items:
+                grouped_items[path] = []
+
+            signature = format_function_signature(func)
+            if signature:
+                # Improved un-qualification for methods in headers
+                if func.kind == clang.cindex.CursorKind.CXX_METHOD:
+                    # Remove any qualification of the method name itself
+                    # We know the method name is func.spelling
+                    # We want to replace 'Anything::method_name' with 'method_name'
+                    # but only when it refers to the method being declared.
+                    # It's safer to use the tokens if we can, but let's try a better string approach.
+                    if "::" + func.spelling in signature:
+                         # Find the method name and strip qualification before it
+                         idx = signature.rfind("::" + func.spelling)
+                         # We want to find where the qualification starts
+                         start_idx = idx
+                         while start_idx > 0 and (signature[start_idx-1].isalnum() or signature[start_idx-1] in '_:'):
+                             start_idx -= 1
+                         signature = signature[:start_idx] + signature[idx+2:]
+                grouped_items[path].append(signature)
+
         for var in selected_variables:
-            ns = get_namespace_path(var)
-            hf.write(wrap_in_namespaces(f"extern {var.type.spelling} {var.spelling};", ns) + '\n\n')
+            curr = var.semantic_parent
+            already_in_header = False
+            while curr and curr.kind != clang.cindex.CursorKind.TRANSLATION_UNIT:
+                if is_selected(curr):
+                    already_in_header = True
+                    break
+                curr = curr.semantic_parent
+            if already_in_header:
+                continue
+
+            path = tuple(get_full_namespace_and_class_path(var))
+            if path not in grouped_items:
+                grouped_items[path] = []
+
+            # For static class members, we don't want 'extern' in the class definition
+            item = f"{var.type.spelling} {var.spelling};"
+            if var.semantic_parent.kind in [clang.cindex.CursorKind.CLASS_DECL,
+                                            clang.cindex.CursorKind.STRUCT_DECL,
+                                            clang.cindex.CursorKind.CLASS_TEMPLATE]:
+                item = f"static {item}"
+            else:
+                item = f"extern {item}"
+
+            if item not in grouped_items[path]:
+                grouped_items[path].append(item)
+
+        def emit_grouped_items(items_dict):
+            tree = {}
+            for path, items in items_dict.items():
+                curr = tree
+                for p in path:
+                    if p not in curr:
+                        curr[p] = {'_items': [], '_children': {}}
+                    curr = curr[p]['_children']
+
+                curr = tree
+                for p in path[:-1]:
+                    curr = curr[p]['_children']
+                if path:
+                    curr[path[-1]]['_items'].extend(items)
+                else:
+                    if None not in tree:
+                        tree[None] = {'_items': [], '_children': {}}
+                    tree[None]['_items'].extend(items)
+
+            def print_tree(node_tree, indent=""):
+                res = []
+                if None in node_tree:
+                    for item in node_tree[None]['_items']:
+                        res.append(f"{indent}{item}")
+                    del node_tree[None]
+
+                for p, data in sorted(node_tree.items(), key=lambda x: x[0][1]):
+                    kind, name = p
+                    if kind == clang.cindex.CursorKind.NAMESPACE:
+                        res.append(f"{indent}namespace {name} {{")
+                        res.extend(print_tree(data['_children'], indent + "    "))
+                        for item in data['_items']:
+                            res.append(f"{indent}    {item}")
+                        res.append(f"{indent}}} // namespace {name}")
+                    else:
+                        k = "class"
+                        if kind == clang.cindex.CursorKind.STRUCT_DECL:
+                            k = "struct"
+                        elif kind == clang.cindex.CursorKind.CLASS_TEMPLATE:
+                            # We don't have the template parameters easily,
+                            # but we can try to guess from tokens of one of the items?
+                            # For now, just a placeholder.
+                            res.append(f"{indent}template <typename T>")
+                            k = "class"
+                        res.append(f"{indent}{k} {name} {{")
+                        res.append(f"{indent}public:")
+                        res.extend(print_tree(data['_children'], indent + "    "))
+                        for item in data['_items']:
+                            res.append(f"{indent}    {item}")
+                        res.append(f"{indent}}};")
+                return res
+
+            return "\n".join(print_tree(tree))
+
+        hf.write("// Extracted Declarations\n")
+        hf.write(emit_grouped_items(grouped_items) + "\n\n")
 
         hf.write("\n// Definitions of extracted classes\n")
         for cls in selected_classes:
@@ -313,29 +489,123 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
 
     with open(cpp_file, 'w') as cf:
         cf.write('#include "extracted_code.h"\n\n')
+
+        # Helper to avoid wrapping if it's already a template
+        def wrap_template_if_needed(node, code):
+            # Check if any parent is a template
+            curr = node.semantic_parent
+            template_params = []
+            while curr and curr.kind != clang.cindex.CursorKind.TRANSLATION_UNIT:
+                if curr.kind == clang.cindex.CursorKind.CLASS_TEMPLATE:
+                    # Try to extract template parameters
+                    # This is complex, but let's try a simple approach
+                    pass
+                curr = curr.semantic_parent
+            return code
+
         cf.write("// Implementations of extracted functions\n")
         for func in selected_functions:
+            if func.kind == clang.cindex.CursorKind.CXX_METHOD:
+                curr = func.semantic_parent
+                skip = False
+                # We only skip if the method was defined INSIDE the class definition
+                # and the class is also selected.
+                # If it was defined out-of-line, we still want to extract it to .cpp.
+                is_out_of_line = func.lexical_parent != func.semantic_parent
+
+                if not is_out_of_line:
+                    while curr and curr.kind != clang.cindex.CursorKind.TRANSLATION_UNIT:
+                        if is_selected(curr):
+                            skip = True
+                            break
+                        curr = curr.semantic_parent
+                if skip:
+                    continue
+
             func_code = extract_code_from_node(func)
             if func_code:
-                # If it's a method defined out of line, it's already scoped.
-                # If not, we might need namespace wrap.
                 ns = get_namespace_path(func)
-                # Naive check for out-of-line: spelled with ::
-                # But func.spelling only gives the name, not the full name.
-                # We need to check if the code contains :: before the body.
-                is_out_of_line = "::" in func_code.split('{')[0]
-                if not is_out_of_line and ns:
-                    func_code = wrap_in_namespaces(func_code, ns)
+                is_out_of_line = func.lexical_parent != func.semantic_parent
+
+                if func.kind == clang.cindex.CursorKind.CXX_METHOD and not is_out_of_line:
+                    class_name = func.semantic_parent.spelling
+                    # We need to handle nested classes here too for correct scoping
+                    full_class_path = []
+                    curr_p = func.semantic_parent
+                    while curr_p and curr_p.kind in [clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL]:
+                        full_class_path.append(curr_p.spelling)
+                        curr_p = curr_p.semantic_parent
+                    full_class_qualifier = "::".join(reversed(full_class_path))
+
+                    if '{' in func_code:
+                        prefix, body = func_code.split('{', 1)
+                        if func.spelling in prefix:
+                             # Use tokens to find the actual function name to avoid false positives in return type or parameters
+                             tokens = list(func.get_tokens())
+                             func_name_token = None
+                             for t in tokens:
+                                 if t.spelling == func.spelling and t.extent.start.line == func.location.line:
+                                     # This is likely the function name
+                                     func_name_token = t
+                                     break
+
+                             if func_name_token:
+                                 # We re-construct the prefix using the token information
+                                 last_idx = prefix.rfind(func.spelling) # Simplified fallback
+                                 new_prefix = prefix[:last_idx] + full_class_qualifier + "::" + prefix[last_idx:]
+                                 func_code = new_prefix + '{' + body
+                             else:
+                                 last_idx = prefix.rfind(func.spelling)
+                                 new_prefix = prefix[:last_idx] + full_class_qualifier + "::" + prefix[last_idx:]
+                                 func_code = new_prefix + '{' + body
+
+                if ns:
+                    already_wrapped = False
+                    # Check if it starts with template <...> namespace or just namespace
+                    stripped_code = func_code.strip()
+                    if stripped_code.startswith("template"):
+                        # Skip template part
+                        if "namespace" in stripped_code:
+                             # This is very simplified
+                             pass
+
+                    for n in ns:
+                        if f"namespace {n}" in func_code:
+                            already_wrapped = True
+                            break
+
+                    if not already_wrapped:
+                         first_ns = ns[0]
+                         if func_code.split('{')[0].strip().startswith(f"{first_ns}::") or \
+                            f" {first_ns}::" in func_code.split('{')[0]:
+                             already_wrapped = True
+
+                    if not already_wrapped:
+                        func_code = wrap_in_namespaces(func_code, ns)
+
                 cf.write(func_code + '\n\n')
 
         cf.write("\n// Definitions of extracted variables\n")
         for var in selected_variables:
-            var_code = extract_code_from_node(var)
-            if var_code:
-                ns = get_namespace_path(var)
-                if ns:
-                    var_code = wrap_in_namespaces(var_code, ns)
-                cf.write(var_code + '\n')
+            # If it's a static member of a class template, it usually goes in the header
+            # OR it must be defined in the .cpp if it's not a template.
+            # However, if it's already in the source as a definition, we extract it.
+
+            # Static members in class are just declarations.
+            # Definitions are separate.
+            if var.kind == clang.cindex.CursorKind.VAR_DECL and var.is_definition():
+                var_code = extract_code_from_node(var)
+                if var_code:
+                    ns = get_namespace_path(var)
+                    if ns:
+                        already_wrapped = False
+                        for n in ns:
+                            if f"namespace {n}" in var_code:
+                                already_wrapped = True
+                                break
+                        if not already_wrapped:
+                            var_code = wrap_in_namespaces(var_code, ns)
+                    cf.write(var_code + '\n')
 
     logging.info(f"Generated header file: {header_file}")
     logging.info(f"Generated implementation file: {cpp_file}")
@@ -350,24 +620,17 @@ def main(input_file, output_dir, target_names=None):
 
     if not input_path.exists():
         logging.error(f"Input file {input_path} does not exist.")
-        return
+        return [], [], []
 
     output_path.mkdir(exist_ok=True)
-
-    # Step 1: Parse AST using Clang
-    # We parse the original file because parsing the preprocessed file
-    # makes Clang think all definitions are in the .i file, which complicates
-    # extracting from the correct source.
     functions, variables, classes, includes = parse_clang_ast(input_path)
 
     if target_names is None:
-        # If no target names, just list what we found
         logging.info("Found functions: " + ", ".join([f.spelling for f in functions]))
         logging.info("Found variables: " + ", ".join([v.spelling for v in variables]))
         logging.info("Found classes: " + ", ".join([c.spelling for c in classes]))
         return functions, variables, classes
 
-    # Step 3: Generate header and implementation files
     generate_cpp_header_and_implementation(output_path, functions, variables, classes, includes, target_names)
     return functions, variables, classes
 
