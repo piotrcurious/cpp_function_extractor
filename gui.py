@@ -37,6 +37,17 @@ class App:
 
         tk.Button(file_frame, text="Analyze Code", command=self.analyze_code).grid(row=2, column=1, pady=5)
 
+        # Filter Frame
+        filter_frame = tk.Frame(self.root, padx=10, pady=5)
+        filter_frame.pack(fill="x")
+        tk.Label(filter_frame, text="Filter:").pack(side="left")
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *args: self.update_selection_list())
+        tk.Entry(filter_frame, textvariable=self.filter_var).pack(side="left", fill="x", expand=True, padx=5)
+
+        tk.Button(filter_frame, text="Select All", command=self.select_all).pack(side="left", padx=2)
+        tk.Button(filter_frame, text="Deselect All", command=self.deselect_all).pack(side="left", padx=2)
+
         # Selection Frame
         self.selection_frame = tk.LabelFrame(self.root, text="Select Items to Extract", padx=10, pady=10)
         self.selection_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -97,6 +108,14 @@ class App:
         if path:
             self.output_dir.set(path)
 
+    def select_all(self):
+        for var in self.selected_items.values():
+            var.set(True)
+
+    def deselect_all(self):
+        for var in self.selected_items.values():
+            var.set(False)
+
     def analyze_code(self):
         if not self.input_file.get():
             messagebox.showwarning("Warning", "Please select an input file.")
@@ -124,36 +143,60 @@ class App:
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
 
+        filter_text = self.filter_var.get().lower()
+
+        # Preserve existing selections if possible
+        old_selections = {usr: var.get() for usr, var in self.selected_items.items()}
         self.selected_items = {}
+
         for item in self.found_items:
-            var = tk.BooleanVar()
-            # Use USR as key to handle overloads
-            self.selected_items[item.get_usr()] = var
-
-            # Map Clang kind to readable text
-            kind_map = {
-                "FUNCTION_DECL": "Function",
-                "CXX_METHOD": "Method",
-                "VAR_DECL": "Variable",
-                "CLASS_DECL": "Class",
-                "STRUCT_DECL": "Struct",
-                "UNION_DECL": "Union",
-                "CLASS_TEMPLATE": "Class Template",
-                "FUNCTION_TEMPLATE": "Function Template",
-                "ENUM_DECL": "Enum",
-                "TYPEDEF_DECL": "Typedef",
-                "TYPE_ALIAS_DECL": "Using Alias",
-                "NAMESPACE_ALIAS": "Namespace Alias",
-                "CONCEPT_DECL": "Concept",
-                "MACRO_DEFINITION": "Macro"
-            }
-            kind = kind_map.get(item.kind.name, item.kind.name.split('_')[-1].title())
-
-            # Get full name to help disambiguate items in different namespaces/classes
+            usr = item.get_usr()
             display_name = refactor_tool.get_full_name(item) if item.kind.name != "MACRO_DEFINITION" else item.spelling
-            loc = f"{item.location.line}:{item.location.column}"
-            cb = tk.Checkbutton(self.scrollable_frame, text=f"{kind}: {display_name} ({loc})", variable=var)
-            cb.pack(anchor="w")
+
+            if filter_text and filter_text not in display_name.lower():
+                continue
+
+            var = tk.BooleanVar(value=old_selections.get(usr, False))
+            self.selected_items[usr] = var
+
+        # Group items by kind
+        categories = {}
+        kind_map = {
+            "FUNCTION_DECL": "Functions",
+            "CXX_METHOD": "Methods",
+            "VAR_DECL": "Variables",
+            "CLASS_DECL": "Classes",
+            "STRUCT_DECL": "Structs",
+            "UNION_DECL": "Unions",
+            "CLASS_TEMPLATE": "Class Templates",
+            "FUNCTION_TEMPLATE": "Function Templates",
+            "ENUM_DECL": "Enums",
+            "TYPEDEF_DECL": "Typedefs",
+            "TYPE_ALIAS_DECL": "Using Aliases",
+            "NAMESPACE_ALIAS": "Namespace Aliases",
+            "CONCEPT_DECL": "Concepts",
+            "MACRO_DEFINITION": "Macros"
+        }
+
+        for item in self.found_items:
+            usr = item.get_usr()
+            if usr not in self.selected_items:
+                continue
+
+            kind_name = kind_map.get(item.kind.name, "Others")
+            if kind_name not in categories:
+                categories[kind_name] = []
+            categories[kind_name].append(item)
+
+        for kind_name in sorted(categories.keys()):
+            lbl = tk.Label(self.scrollable_frame, text=kind_name, font=("", 10, "bold"), pady=5)
+            lbl.pack(anchor="w")
+            for item in categories[kind_name]:
+                usr = item.get_usr()
+                display_name = refactor_tool.get_full_name(item) if item.kind.name != "MACRO_DEFINITION" else item.spelling
+                loc = f"{item.location.line}:{item.location.column}"
+                cb = tk.Checkbutton(self.scrollable_frame, text=f"{display_name} ({loc})", variable=self.selected_items[usr])
+                cb.pack(anchor="w", padx=20)
 
     def extract_code(self):
         targets = [usr for usr, var in self.selected_items.items() if var.get()]
