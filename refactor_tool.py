@@ -109,7 +109,8 @@ def parse_clang_ast(input_file):
         elif node.kind == clang.cindex.CursorKind.ENUM_DECL and node.is_definition():
             enums.append(node)
         elif node.kind in [clang.cindex.CursorKind.TYPEDEF_DECL,
-                           clang.cindex.CursorKind.TYPE_ALIAS_DECL]:
+                           clang.cindex.CursorKind.TYPE_ALIAS_DECL,
+                           clang.cindex.CursorKind.NAMESPACE_ALIAS]:
             aliases.append(node)
         elif node.kind == clang.cindex.CursorKind.INCLUSION_DIRECTIVE:
             includes.append(node)
@@ -124,7 +125,7 @@ def parse_clang_ast(input_file):
     return functions, variables, classes, includes, enums, aliases, macros
 
 
-def extract_code_from_node(node):
+def extract_code_from_node(node, include_comments=True):
     start = node.extent.start
     end = node.extent.end
     try:
@@ -132,6 +133,36 @@ def extract_code_from_node(node):
             lines = f.readlines()
 
         tokens = list(node.get_tokens())
+
+        # Capture leading comments if requested
+        if include_comments:
+            # Look at tokens before the extent start in the same file
+            # This is tricky using node.get_tokens(). We should use TU tokens.
+            tu = node.translation_unit
+            # Get tokens for the line(s) before
+            if start.line > 1:
+                comment_search_start = clang.cindex.SourceLocation.from_position(tu, start.file, max(1, start.line - 5), 1)
+                comment_search_end = start
+                pre_tokens = list(tu.get_tokens(extent=clang.cindex.SourceRange.from_locations(comment_search_start, comment_search_end)))
+
+                leading_comments = []
+                for t in reversed(pre_tokens):
+                    if t.kind == clang.cindex.TokenKind.COMMENT:
+                        leading_comments.append(t.spelling)
+                    elif t.spelling in [';', '}', '{']: # Stop at previous declaration end
+                        break
+                    elif t.kind != clang.cindex.TokenKind.PUNCTUATION: # Some other token
+                         # If it's on the same line as the start, it might be an attribute, handled elsewhere
+                         pass
+
+                if leading_comments:
+                    # They are in reverse order
+                    comments_text = "\n".join(reversed(leading_comments))
+                else:
+                    comments_text = ""
+            else:
+                comments_text = ""
+
         if tokens:
             last_token = tokens[-1]
             end_loc = last_token.extent.end
@@ -144,6 +175,9 @@ def extract_code_from_node(node):
                     res.append(lines[i])
                 res.append(lines[end_loc.line - 1][: end_loc.column - 1])
                 code = "".join(res).strip()
+
+            if include_comments and comments_text:
+                code = comments_text + "\n" + code
         else:
             if start.line == end.line:
                 return lines[start.line - 1][start.column - 1 : end.column].strip()
@@ -167,7 +201,8 @@ def extract_code_from_node(node):
             clang.cindex.CursorKind.UNION_DECL,
             clang.cindex.CursorKind.CLASS_TEMPLATE, clang.cindex.CursorKind.VAR_DECL,
             clang.cindex.CursorKind.FIELD_DECL, clang.cindex.CursorKind.ENUM_DECL,
-            clang.cindex.CursorKind.TYPEDEF_DECL, clang.cindex.CursorKind.TYPE_ALIAS_DECL
+            clang.cindex.CursorKind.TYPEDEF_DECL, clang.cindex.CursorKind.TYPE_ALIAS_DECL,
+            clang.cindex.CursorKind.NAMESPACE_ALIAS
         ]
         if needs_semicolon and not code.endswith(';'):
             code += ';'
