@@ -106,18 +106,12 @@ class App:
             try:
                 # We need to run this in a thread because it might take time
                 result = refactor_tool.main(self.input_file.get(), self.output_dir.get())
-                # Handle both 3-tuple and 4-tuple for backward compatibility if needed,
-                # but our refactor_tool now returns 4 or 5 (due to includes/enums? wait)
-                # Let's check refactor_tool.py main again.
-                if len(result) == 4:
-                     functions, variables, classes, enums = result
-                     self.found_items = functions + variables + classes + enums
-                else:
-                     # Fallback for unexpected return length
-                     self.found_items = []
-                     for items in result:
-                         if isinstance(items, list):
-                             self.found_items.extend(items)
+
+                # result is now (functions, variables, classes, enums, aliases, macros)
+                self.found_items = []
+                for items in result:
+                    if isinstance(items, list):
+                        self.found_items.extend(items)
 
                 self.root.after(0, self.update_selection_list)
             except Exception as e:
@@ -146,13 +140,17 @@ class App:
                 "UNION_DECL": "Union",
                 "CLASS_TEMPLATE": "Class Template",
                 "FUNCTION_TEMPLATE": "Function Template",
-                "ENUM_DECL": "Enum"
+                "ENUM_DECL": "Enum",
+                "TYPEDEF_DECL": "Typedef",
+                "TYPE_ALIAS_DECL": "Using Alias",
+                "MACRO_DEFINITION": "Macro"
             }
             kind = kind_map.get(item.kind.name, item.kind.name.split('_')[-1].title())
 
-            # Get location to help disambiguate
+            # Get full name to help disambiguate items in different namespaces/classes
+            display_name = refactor_tool.get_full_name(item) if item.kind.name != "MACRO_DEFINITION" else item.spelling
             loc = f"{item.location.line}:{item.location.column}"
-            cb = tk.Checkbutton(self.scrollable_frame, text=f"{kind}: {item.spelling} ({loc})", variable=var)
+            cb = tk.Checkbutton(self.scrollable_frame, text=f"{kind}: {display_name} ({loc})", variable=var)
             cb.pack(anchor="w")
 
     def extract_code(self):

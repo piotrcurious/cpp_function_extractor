@@ -82,9 +82,9 @@ def parse_clang_ast(input_file):
                 logging.warning(f"Clang Diagnostic: {diagnostic}")
     except Exception as e:
         logging.error(f"Failed to parse file: {e}")
-        return [], [], [], [], []
+        return [], [], [], [], [], [], []
 
-    functions, variables, classes, includes, enums = [], [], [], [], []
+    functions, variables, classes, includes, enums, aliases, macros = [], [], [], [], [], [], []
 
     def extract_declarations(node):
         if node.location.file and node.location.file.name != str(input_file):
@@ -108,14 +108,20 @@ def parse_clang_ast(input_file):
             classes.append(node)
         elif node.kind == clang.cindex.CursorKind.ENUM_DECL and node.is_definition():
             enums.append(node)
+        elif node.kind in [clang.cindex.CursorKind.TYPEDEF_DECL,
+                           clang.cindex.CursorKind.TYPE_ALIAS_DECL]:
+            aliases.append(node)
         elif node.kind == clang.cindex.CursorKind.INCLUSION_DIRECTIVE:
             includes.append(node)
+        elif node.kind == clang.cindex.CursorKind.MACRO_DEFINITION:
+            if node.location.file and node.location.file.name == str(input_file):
+                macros.append(node)
 
         for child in node.get_children():
             extract_declarations(child)
 
     extract_declarations(translation_unit.cursor)
-    return functions, variables, classes, includes, enums
+    return functions, variables, classes, includes, enums, aliases, macros
 
 
 def extract_code_from_node(node):
@@ -160,7 +166,8 @@ def extract_code_from_node(node):
             clang.cindex.CursorKind.CLASS_DECL, clang.cindex.CursorKind.STRUCT_DECL,
             clang.cindex.CursorKind.UNION_DECL,
             clang.cindex.CursorKind.CLASS_TEMPLATE, clang.cindex.CursorKind.VAR_DECL,
-            clang.cindex.CursorKind.FIELD_DECL, clang.cindex.CursorKind.ENUM_DECL
+            clang.cindex.CursorKind.FIELD_DECL, clang.cindex.CursorKind.ENUM_DECL,
+            clang.cindex.CursorKind.TYPEDEF_DECL, clang.cindex.CursorKind.TYPE_ALIAS_DECL
         ]
         if needs_semicolon and not code.endswith(';'):
             code += ';'
@@ -181,7 +188,36 @@ def get_full_name(node):
 
 def format_function_signature(func):
     try:
-        tokens = list(func.get_tokens())
+        # Check for virtual/static keywords
+        prefix_keywords = []
+        if func.is_virtual_method():
+            prefix_keywords.append("virtual")
+        if func.is_static_method():
+            prefix_keywords.append("static")
+
+        # We try to get tokens from the lexical parent if necessary to capture attributes
+        # but Clang is usually good enough if we know where to look.
+        # Let's try to get tokens from the start of the extent, but sometimes attributes
+        # are just before.
+
+        # Experimental: get tokens from a bit before the extent start
+        # We'll use the translation unit to get tokens in a range
+        tu = func.translation_unit
+        start_extent = func.extent.start
+        # Look back some lines/columns to see if we find attributes
+        file_name = start_extent.file.name
+
+        # Try to find the start of the line or previous line
+        # This is safer to avoid skipping [[attributes]]
+        # We'll use get_extent with start and end locations
+        search_start = clang.cindex.SourceLocation.from_position(tu, start_extent.file, start_extent.line, 1)
+        search_end = func.extent.end
+        tokens = list(tu.get_tokens(extent=clang.cindex.SourceRange.from_locations(search_start, search_end)))
+
+        # If the first token is after the extent start, we might have missed something
+        # but here the extent start is 9:15 and constexpr is at 9:15.
+        # [[nodiscard]] is at 9:3.
+
         if not tokens:
              return func.type.spelling + " " + func.spelling + ";"
 
@@ -191,10 +227,13 @@ def format_function_signature(func):
                 body_start = child.extent.start
                 break
 
+        # We also need to check if there are tokens before the extent start
+        # (Attributes like [[nodiscard]] might be before)
+
         sig_tokens = []
         for token in tokens:
-            if body_start and token.extent.start.line >= body_start.line and \
-               token.extent.start.column >= body_start.column:
+            if body_start and (token.extent.start.line > body_start.line or \
+               (token.extent.start.line == body_start.line and token.extent.start.column >= body_start.column)):
                 break
             if token.spelling == '{':
                 break
@@ -208,6 +247,7 @@ def format_function_signature(func):
             sig = sig.replace(" ,", ",").replace(" :", ":")
             sig = sig.replace(":: ", "::").replace(" ::", "::")
             sig = sig.replace("< ", "<").replace(" >", ">").replace(" <", "<")
+            sig = sig.replace("[ [", "[[").replace(" ] ]", "]]").replace(" ]]", "]]").replace("[[ ", "[[")
             return sig.strip() + ";"
 
         return func.type.spelling + " " + func.spelling + ";"
@@ -249,7 +289,7 @@ def wrap_in_namespaces(code, namespaces):
         res.append(f"}} // namespace {ns}")
     return "\n".join(res)
 
-def generate_cpp_header_and_implementation(output_dir, functions, variables, classes, includes, enums, target_names=None):
+def generate_cpp_header_and_implementation(output_dir, functions, variables, classes, includes, enums, aliases, macros, target_names=None):
     header_file = output_dir / 'extracted_code.h'
     cpp_file = output_dir / 'extracted_code.cpp'
 
@@ -267,9 +307,22 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
     selected_variables = [v for v in variables if is_selected(v)]
     selected_classes = [c for c in classes if is_selected(c)]
     selected_enums = [e for e in enums if is_selected(e)]
+    selected_aliases = [a for a in aliases if is_selected(a)]
+    selected_macros = [m for m in macros if is_selected(m)]
 
     with open(header_file, 'w') as hf:
         hf.write("#ifndef EXTRACTED_CODE_H\n#define EXTRACTED_CODE_H\n\n")
+
+        if selected_macros:
+            hf.write("// Extracted Macros\n")
+            for macro in selected_macros:
+                macro_code = extract_code_from_node(macro)
+                if macro_code:
+                    if not macro_code.startswith("#"):
+                        hf.write("#define " + macro_code + "\n")
+                    else:
+                        hf.write(macro_code + "\n")
+            hf.write("\n")
 
         if includes:
             hf.write("// Extracted Includes\n")
@@ -293,6 +346,12 @@ def generate_cpp_header_and_implementation(output_dir, functions, variables, cla
                 grouped_items[path_key] = {'nodes': path_nodes, 'items': []}
             if code_snippet not in grouped_items[path_key]['items']:
                 grouped_items[path_key]['items'].append(code_snippet)
+
+        # Handle aliases
+        for al in selected_aliases:
+            al_code = extract_code_from_node(al)
+            if al_code:
+                add_to_grouped_items(al, al_code)
 
         # Handle enums
         for enm in selected_enums:
@@ -507,17 +566,19 @@ def main(input_file, output_dir, target_names=None):
     input_path, output_path = Path(input_file), Path(output_dir)
     if not input_path.exists():
         logging.error(f"Input file {input_path} does not exist.")
-        return [], [], [], []
+        return [], [], [], [], [], []
     output_path.mkdir(exist_ok=True)
-    functions, variables, classes, includes, enums = parse_clang_ast(input_path)
+    functions, variables, classes, includes, enums, aliases, macros = parse_clang_ast(input_path)
     if target_names is None:
         logging.info("Found functions: " + ", ".join([f.spelling for f in functions]))
         logging.info("Found variables: " + ", ".join([v.spelling for v in variables]))
         logging.info("Found classes: " + ", ".join([c.spelling for c in classes]))
         logging.info("Found enums: " + ", ".join([e.spelling for e in enums]))
-        return functions, variables, classes, enums
-    generate_cpp_header_and_implementation(output_path, functions, variables, classes, includes, enums, target_names)
-    return functions, variables, classes, enums
+        logging.info("Found aliases: " + ", ".join([a.spelling for a in aliases]))
+        logging.info("Found macros: " + ", ".join([m.spelling for m in macros]))
+        return functions, variables, classes, enums, aliases, macros
+    generate_cpp_header_and_implementation(output_path, functions, variables, classes, includes, enums, aliases, macros, target_names)
+    return functions, variables, classes, enums, aliases, macros
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="C++ Code Extraction and Refactoring Tool")
