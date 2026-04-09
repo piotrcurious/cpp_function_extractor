@@ -144,6 +144,7 @@ class App:
                 "TYPEDEF_DECL": "Typedef",
                 "TYPE_ALIAS_DECL": "Using Alias",
                 "NAMESPACE_ALIAS": "Namespace Alias",
+                "CONCEPT_DECL": "Concept",
                 "MACRO_DEFINITION": "Macro"
             }
             kind = kind_map.get(item.kind.name, item.kind.name.split('_')[-1].title())

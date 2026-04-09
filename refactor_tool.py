@@ -42,7 +42,7 @@ if libclang_file:
 
 def parse_clang_ast(input_file):
     index = clang.cindex.Index.create()
-    args = ['-x', 'c++', '-std=c++17', '-D__CODE_GENERATOR__']
+    args = ['-x', 'c++', '-std=c++20', '-D__CODE_GENERATOR__']
 
     try:
         proc = subprocess.run(['g++', '-E', '-x', 'c++', '-', '-v'],
@@ -108,6 +108,8 @@ def parse_clang_ast(input_file):
             classes.append(node)
         elif node.kind == clang.cindex.CursorKind.ENUM_DECL and node.is_definition():
             enums.append(node)
+        elif node.kind == clang.cindex.CursorKind.CONCEPT_DECL:
+            enums.append(node) # Use enums list for simplicity or add to aliases? Classes might be better.
         elif node.kind in [clang.cindex.CursorKind.TYPEDEF_DECL,
                            clang.cindex.CursorKind.TYPE_ALIAS_DECL,
                            clang.cindex.CursorKind.NAMESPACE_ALIAS]:
@@ -202,7 +204,7 @@ def extract_code_from_node(node, include_comments=True):
             clang.cindex.CursorKind.CLASS_TEMPLATE, clang.cindex.CursorKind.VAR_DECL,
             clang.cindex.CursorKind.FIELD_DECL, clang.cindex.CursorKind.ENUM_DECL,
             clang.cindex.CursorKind.TYPEDEF_DECL, clang.cindex.CursorKind.TYPE_ALIAS_DECL,
-            clang.cindex.CursorKind.NAMESPACE_ALIAS
+            clang.cindex.CursorKind.NAMESPACE_ALIAS, clang.cindex.CursorKind.CONCEPT_DECL
         ]
         if needs_semicolon and not code.endswith(';'):
             code += ';'
@@ -283,6 +285,8 @@ def format_function_signature(func):
             sig = sig.replace(":: ", "::").replace(" ::", "::")
             sig = sig.replace("< ", "<").replace(" >", ">").replace(" <", "<")
             sig = sig.replace("[ [", "[[").replace(" ] ]", "]]").replace(" ]]", "]]").replace("[[ ", "[[")
+            # C++20 concepts/constraints cleanup
+            sig = sig.replace("template<", "template <")
             return sig.strip() + ";"
 
         return func.type.spelling + " " + func.spelling + ";"
